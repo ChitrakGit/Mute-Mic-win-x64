@@ -56,12 +56,7 @@ use windows::Win32::UI::Shell::{
 use windows::Win32::Media::Audio::Endpoints::IAudioEndpointVolume;
 
 // COM initialization and object creation functions
-use windows::Win32::System::Com::{
-    CoCreateInstance,       // Creates a COM object (here: the device enumerator)
-    CoInitialize,           // Initializes COM for the current thread
-    CLSCTX_INPROC_SERVER,  // Flag: create COM object in the same process
-    CoUninitialize,         // Cleans up COM when we're done
-};
+// Moved to src/audio.rs
 
 // Console control handler — lets us intercept Ctrl+C, window close, logoff, shutdown
 use windows::Win32::System::Console::{
@@ -76,12 +71,7 @@ use windows::Win32::System::Console::{
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 
 // Audio device enumeration types
-use windows::Win32::Media::Audio::{
-    eCapture,              // We want a capture device (microphone), not a playback device (speakers)
-    eConsole,              // We want the default device for the "console" role (general use)
-    IMMDeviceEnumerator,   // COM interface to list/find audio devices
-    MMDeviceEnumerator,    // CLSID (class identifier) to create the device enumerator
-};
+// Moved to src/audio.rs
 
 // Win32 windowing functions and constants
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -124,28 +114,10 @@ struct AppState {
 fn main() -> Result<()> {
     unsafe {
         // Step 1: Initialize COM library for this thread.
-        // COM must be initialized before calling any COM functions.
-        // We use .ok() to ignore the "already initialized" case.
-        CoInitialize(None).ok();
+        muteMic::audio::init_com();
 
-        // Step 2: Create a device enumerator to find audio devices.
-        // CoCreateInstance creates a COM object given its class ID (MMDeviceEnumerator).
-        // CLSCTX_INPROC_SERVER means "create the object in our process".
-        let enumerator: IMMDeviceEnumerator = CoCreateInstance(
-            &MMDeviceEnumerator,
-            None,
-            CLSCTX_INPROC_SERVER,
-        )?;
-
-        // Step 3: Get the default microphone device.
-        // eCapture = input device (microphone), eConsole = general-purpose role.
-        let device = enumerator.GetDefaultAudioEndpoint(eCapture, eConsole)?;
-
-        // Step 4: Activate the IAudioEndpointVolume interface on the mic device.
-        // This gives us the ability to get/set mute state and volume level.
-        // Note: We use Activate() instead of cast() because IMMDevice requires
-        // activation to create the volume control interface.
-        let volume_control: IAudioEndpointVolume = device.Activate(CLSCTX_INPROC_SERVER, None)?;
+        // Step 2-4: Get the default microphone device volume controller.
+        let volume_control = muteMic::audio::get_default_mic_volume()?;
 
         // Step 5: Store the volume controller in a global static variable.
         // We wrap it in an AgileReference so it can be safely used from any thread.
@@ -177,8 +149,7 @@ fn main() -> Result<()> {
     }
 
     // Step 10: Uninitialize COM.
-    // Must be called once for each successful CoInitialize call.
-    unsafe { CoUninitialize() };
+    muteMic::audio::uninit_com();
 
     Ok(())
 }
