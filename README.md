@@ -3,10 +3,10 @@
 **muteMic** is a lightweight, background Windows application written in Rust that allows you to easily mute and unmute your default microphone. It sits quietly in your system tray and provides a global hotkey so you can quickly toggle your microphone from anywhere in Windows.
 
 ## 🚀 Download
-You can download the compiled executable directly from the GitHub Releases page:
-- **[Download the latest muteMic.exe here](https://github.com/ChitrakGit/Mute-Mic-win-x64/releases/latest)**
+You can download the compiled executable directly from this repository:
+- **[Download muteMic.exe](https://github.com/ChitrakGit/Mute-Mic-win-x64/raw/main/Downloads/muteMic.exe)**
 
-*(Note: Download the `.exe` file from the Assets section of the latest release. No installation is required, just run it!)*
+*(Note: No installation is required, just download and run it!)*
 
 ## Features
 - **Background Application:** No console window, runs entirely in the background.
