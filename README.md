@@ -47,6 +47,17 @@ If you haven't already, install the Rust compiler and `cargo` package manager.
 4. **Hotkey:** Press `Ctrl + Shift + M` on your keyboard at any time to toggle the mute state.
 5. **Hover:** Hover your mouse over the tray icon to verify if your microphone is currently muted or unmuted.
 
+## Run on Startup
+
+To have `muteMic` start automatically when you log in to Windows:
+1. Press `Win + R` to open the Windows Run dialog.
+2. Type `shell:startup` and press **Enter**. This will open your Startup folder.
+3. Right-click on empty space in the folder and select **New > Shortcut**.
+4. Browse to your `muteMic` directory and select `target\release\muteMic.exe`.
+5. Click **Next**, then **Finish**. 
+
+The app will now launch quietly in your system tray every time you turn on your PC!
+
 ## Built With
 - [Rust](https://www.rust-lang.org/)
 - [windows-rs](https://github.com/microsoft/windows-rs) - Official Microsoft Windows API bindings for Rust.
