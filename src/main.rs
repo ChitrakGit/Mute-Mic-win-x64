@@ -37,6 +37,12 @@ use windows::Win32::Foundation::{BOOL, HWND, LPARAM, LRESULT, WPARAM, POINT};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreatePopupMenu, AppendMenuW, TrackPopupMenu,
     SetForegroundWindow, MF_STRING, TPM_BOTTOMALIGN, TPM_LEFTALIGN,
+    WM_HOTKEY,
+};
+
+// Global Hotkeys API
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    RegisterHotKey, UnregisterHotKey, MOD_CONTROL, MOD_SHIFT, HOT_KEY_MODIFIERS
 };
 
 // System tray (Shell) API
@@ -183,6 +189,7 @@ fn main() -> Result<()> {
 const ID_MUTE: u16 = 1001;
 const ID_UNMUTE: u16 = 1002;
 const ID_EXIT: u16 = 1003;
+const ID_HOTKEY_MUTE: i32 = 1;
 
 // Custom message ID for tray icon events (WM_USER + 1)
 const WM_TRAYICON: u32 = windows::Win32::UI::WindowsAndMessaging::WM_USER + 1;
@@ -234,22 +241,22 @@ fn create_window() -> Result<()> {
         //   - Default::default(): no visible style
         //   - class_name: the class we just registered
         //   - title: "MuteMicHidden"
-        //   - Default::default(): no styles like WS_OVERLAPPEDWINDOW
-        //   - 0, 0, 0, 0: position and size don't matter
-        //   - None: no parent window, no menu
-        //   - instance: our executable handle
-        //   - None: no extra creation data
-        CreateWindowExW(
+        let hwnd = CreateWindowExW(
             Default::default(),
             class_name,
-            w!("MuteMicHidden"),
-            Default::default(), // No visible style
-            0, 0, 0, 0,         // Size/pos don't matter
-            None,
+            w!("MuteMic"),
+            windows::Win32::UI::WindowsAndMessaging::WS_POPUP,
+            0, 0, 0, 0,
+            HWND(0),
             None,
             instance,
             None,
         );
+
+        // Register our global hotkey (Ctrl + Shift + M)
+        // 0x4D is the virtual key code for 'M'
+        let modifiers = HOT_KEY_MODIFIERS(MOD_CONTROL.0 | MOD_SHIFT.0);
+        let _ = RegisterHotKey(hwnd, ID_HOTKEY_MUTE, modifiers, 0x4D);
 
         Ok(())
     }
@@ -278,9 +285,6 @@ fn show_tray_menu(hwnd: HWND) {
 // ============================================================================
 // wndproc() — Window procedure: handles all messages sent to our window
 // ============================================================================
-// Windows calls this function every time something happens to our window
-// (created, button clicked, closed, resized, etc.).
-// We handle 3 messages and let Windows handle everything else via DefWindowProcW.
 unsafe extern "system" fn wndproc(
     hwnd: HWND,       // Handle to the window receiving the message
     msg: u32,         // The message type (WM_CREATE, WM_COMMAND, WM_DESTROY, etc.)
@@ -292,15 +296,12 @@ unsafe extern "system" fn wndproc(
         // WM_CREATE — Window is being created. Set up the tray icon.
         // ----------------------------------------------------------------
         WM_CREATE => {
-            // Retrieve the volume controller from the global static variable.
             let agile_ref = VOLUME_CONTROL.get().expect("Volume control not initialized");
             let volume_control = agile_ref.resolve().expect("Failed to resolve agile reference");
 
-            // Check initial mute state
             let is_muted = volume_control.GetMute().unwrap_or(BOOL(0)).as_bool();
             let tip_text = if is_muted { "MuteMic - Muted" } else { "MuteMic - Unmuted" };
 
-            // Setup tray icon
             let mut nid: NOTIFYICONDATAW = std::mem::zeroed();
             nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
             nid.hWnd = hwnd;
@@ -308,8 +309,6 @@ unsafe extern "system" fn wndproc(
             nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
             nid.uCallbackMessage = WM_TRAYICON;
             
-            // We need an instance handle for LoadIconW if we use a custom icon, 
-            // but for IDI_APPLICATION, None is used.
             nid.hIcon = windows::Win32::UI::WindowsAndMessaging::LoadIconW(None, IDI_APPLICATION).unwrap();
 
             for (i, c) in tip_text.encode_utf16().enumerate() {
@@ -349,7 +348,6 @@ unsafe extern "system" fn wndproc(
                     tip_text = "MuteMic - Unmuted";
                     update_tip = true;
                 } else if command == ID_EXIT {
-                    // Handled in WM_DESTROY, but we trigger it by destroying the window
                     let _ = windows::Win32::UI::WindowsAndMessaging::DestroyWindow(hwnd);
                 }
 
@@ -359,8 +357,31 @@ unsafe extern "system" fn wndproc(
                         if i >= app_state.nid.szTip.len() - 1 { break; }
                         app_state.nid.szTip[i] = c;
                     }
-                    app_state.nid.uFlags = NIF_TIP;
-                    Shell_NotifyIconW(NIM_MODIFY, &app_state.nid);
+                    let _ = Shell_NotifyIconW(NIM_MODIFY, &app_state.nid);
+                }
+            }
+            LRESULT(0)
+        }
+
+        // ----------------------------------------------------------------
+        // WM_HOTKEY — Our global hotkey was pressed
+        // ----------------------------------------------------------------
+        WM_HOTKEY => {
+            let app_state_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut AppState;
+            if !app_state_ptr.is_null() {
+                let app_state = &mut *app_state_ptr;
+                if wparam.0 as i32 == ID_HOTKEY_MUTE {
+                    let is_muted = app_state.volume_control.GetMute().unwrap_or(BOOL(0)).as_bool();
+                    let _ = app_state.volume_control.SetMute(!is_muted, null());
+                    
+                    // Update tooltip
+                    let tip_text = if !is_muted { "MuteMic - Muted" } else { "MuteMic - Unmuted" };
+                    app_state.nid.szTip.fill(0);
+                    for (i, c) in tip_text.encode_utf16().enumerate() {
+                        if i >= app_state.nid.szTip.len() - 1 { break; }
+                        app_state.nid.szTip[i] = c;
+                    }
+                    let _ = Shell_NotifyIconW(NIM_MODIFY, &app_state.nid);
                 }
             }
             LRESULT(0)
@@ -389,7 +410,7 @@ unsafe extern "system" fn wndproc(
                 
                 drop(Box::from_raw(app_state_ptr));
             }
-
+            let _ = UnregisterHotKey(hwnd, ID_HOTKEY_MUTE);
             PostQuitMessage(0);
             LRESULT(0)
         }

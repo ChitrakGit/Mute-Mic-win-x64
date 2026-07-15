@@ -195,7 +195,29 @@ Shell_NotifyIconW(NIM_MODIFY, &nid);
 
 ---
 
-### Step 10: Build the Release Version
+### Step 10: Global Hotkey Integration (Ctrl + Shift + M)
+To allow muting/unmuting from anywhere, we register a global hotkey with the OS.
+
+1. Add `"Win32_UI_Input_KeyboardAndMouse"` to `Cargo.toml`.
+2. Register the hotkey in `create_window` after the window is created:
+```rust
+use windows::Win32::UI::Input::KeyboardAndMouse::{RegisterHotKey, HOT_KEY_MODIFIERS, MOD_CONTROL, MOD_SHIFT};
+
+const ID_HOTKEY_MUTE: i32 = 1;
+let modifiers = HOT_KEY_MODIFIERS(MOD_CONTROL.0 | MOD_SHIFT.0);
+RegisterHotKey(hwnd, ID_HOTKEY_MUTE, modifiers, 0x4D); // 0x4D is 'M'
+```
+3. Handle the `WM_HOTKEY` message in `wndproc`:
+```rust
+WM_HOTKEY => {
+    // Read current mute state, toggle it, and update tooltip (same logic as menu clicks)
+}
+```
+4. Remember to unregister it in `WM_DESTROY` using `UnregisterHotKey(hwnd, ID_HOTKEY_MUTE)`.
+
+---
+
+### Step 11: Build the Release Version
 ```powershell
 cargo build --release
 ```
@@ -204,22 +226,24 @@ The resulting `target/release/muteMic.exe` will:
 - Have **no console window**
 - Show a **tray icon** near the clock
 - Let users **right-click → Mute / Unmute / Exit**
+- Toggle mute via **Ctrl + Shift + M** globally
 - **Auto-unmute** on exit
 
 ---
 
-## Summary of Changes
+## Final File Summary
 
-| File | Change |
-|------|--------|
+| File | Change Made |
+|---|---|
 | `main.rs` | Add `#![windows_subsystem = "windows"]` at top |
 | `main.rs` | Replace visible window with hidden message window |
 | `main.rs` | Add tray icon setup with `Shell_NotifyIconW` |
 | `main.rs` | Add `WM_TRAYICON` handler for right-click menu |
+| `main.rs` | Add `WM_HOTKEY` handler for `Ctrl + Shift + M` |
 | `main.rs` | Add popup menu (Mute/Unmute/Exit) |
-| `main.rs` | Remove tray icon in `WM_DESTROY` |
+| `main.rs` | Remove tray icon and unregister hotkey in `WM_DESTROY` |
 | `main.rs` | Remove old buttons/label UI code |
-| `Cargo.toml` | Add `"Win32_UI_Shell"` feature |
+| `Cargo.toml` | Add `"Win32_UI_Shell"` and `"Win32_UI_Input_KeyboardAndMouse"` features |
 
 ---
 
