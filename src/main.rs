@@ -1,3 +1,5 @@
+#![windows_subsystem = "windows"]
+
 // ============================================================================
 // muteMic - A simple Windows GUI app to mute/unmute the microphone
 // ============================================================================
@@ -24,16 +26,25 @@ use std::sync::OnceLock;  // Thread-safe, write-once global storage (initialized
 
 // --- Windows crate imports ---
 // Core types and macros
-use windows::core::{w, HSTRING};           // w!() macro creates wide string literals; HSTRING is a heap-allocated wide string
-use windows::core::{AgileReference, Result}; // AgileReference: thread-safe COM wrapper; Result: Windows error type
+use windows::core::{w, AgileReference, Result}; // w!() macro creates wide string literals; AgileReference: thread-safe COM wrapper; Result: Windows error type
 
 // Foundation types — basic Win32 handle and message types
-use windows::Win32::Foundation::{BOOL, HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{BOOL, HWND, LPARAM, LRESULT, WPARAM, POINT};
 // BOOL: Win32 boolean (not Rust's bool), HWND: window handle,
-// LPARAM/WPARAM: message parameters, LRESULT: message return value
+// LPARAM/WPARAM: message parameters, LRESULT: message return value, POINT: x,y coordinates
 
-// HMENU: Handle to a menu — also used as a control ID when creating child windows (buttons, labels)
-use windows::Win32::UI::WindowsAndMessaging::HMENU;
+// Menu and UI interaction
+use windows::Win32::UI::WindowsAndMessaging::{
+    CreatePopupMenu, AppendMenuW, TrackPopupMenu,
+    SetForegroundWindow, MF_STRING, TPM_BOTTOMALIGN, TPM_LEFTALIGN,
+};
+
+// System tray (Shell) API
+use windows::Win32::UI::Shell::{
+    Shell_NotifyIconW, NOTIFYICONDATAW,
+    NIM_ADD, NIM_DELETE, NIM_MODIFY,
+    NIF_MESSAGE, NIF_ICON, NIF_TIP,
+};
 
 // IAudioEndpointVolume: The COM interface that controls mute/unmute and volume of an audio device
 use windows::Win32::Media::Audio::Endpoints::IAudioEndpointVolume;
@@ -77,23 +88,17 @@ use windows::Win32::UI::WindowsAndMessaging::{
     PostQuitMessage,      // Posts WM_QUIT to exit the message loop
     RegisterClassW,       // Registers our window class with Windows
     SetWindowLongPtrW,    // Stores data (AppState pointer) with the window
-    SetWindowTextW,       // Changes the text of a window or control (used for status label)
-    ShowWindow,           // Shows or hides a window
     TranslateMessage,     // Translates virtual-key messages into character messages
     CS_HREDRAW,           // Redraw entire window when width changes
     CS_VREDRAW,           // Redraw entire window when height changes
-    CW_USEDEFAULT,        // Let Windows choose the default position
     GWLP_USERDATA,        // Index for storing our custom data (AppState) with the window
     IDC_ARROW,            // Standard arrow cursor
     MSG,                  // Message structure for the message loop
-    SW_SHOW,              // Flag to make the window visible
-    WM_COMMAND,           // Message sent when a button is clicked
+    WM_COMMAND,           // Message sent when a menu item is clicked
     WM_CREATE,            // Message sent when the window is first created
     WM_DESTROY,           // Message sent when the window is being destroyed (closed)
     WNDCLASSW,            // Structure that defines our window class
-    WS_CHILD,             // Style: this is a child window (for buttons/labels inside our main window)
-    WS_OVERLAPPEDWINDOW,  // Style: standard window with title bar, borders, min/max/close buttons
-    WS_VISIBLE,           // Style: the control is visible immediately after creation
+    IDI_APPLICATION,      // Default application icon
 };
 
 // ============================================================================
@@ -101,12 +106,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
 // ============================================================================
 // This struct is heap-allocated (Box<AppState>) and its raw pointer is stored
 // with the window via SetWindowLongPtrW. We retrieve it in WM_COMMAND and
-// WM_DESTROY to access the volume controller and status label.
+// WM_DESTROY to access the volume controller and tray icon data.
 struct AppState {
     volume_control: IAudioEndpointVolume,  // COM interface to mute/unmute the mic
-    _mute_button: HWND,                    // Handle to the "Mute" button (prefixed with _ because we don't read it after creation)
-    _unmute_button: HWND,                  // Handle to the "Unmute" button (same as above)
-    status_label: HWND,                    // Handle to the "Status: ..." text label (we update its text)
+    nid: NOTIFYICONDATAW,                  // System tray icon data (needed to modify/delete the icon)
 }
 
 // ============================================================================
@@ -175,12 +178,16 @@ fn main() -> Result<()> {
 }
 
 // ============================================================================
-// Constants — Button IDs used to identify which button was clicked
+// Constants — Menu IDs and custom messages
 // ============================================================================
-// When Windows sends WM_COMMAND, it includes the control ID in wparam.
-// We compare against these to know if "Mute" or "Unmute" was clicked.
-const MUTE_BUTTON_ID: isize = 1;
-const UNMUTE_BUTTON_ID: isize = 2;
+const ID_MUTE: u16 = 1001;
+const ID_UNMUTE: u16 = 1002;
+const ID_EXIT: u16 = 1003;
+
+// Custom message ID for tray icon events (WM_USER + 1)
+const WM_TRAYICON: u32 = windows::Win32::UI::WindowsAndMessaging::WM_USER + 1;
+// Right-click event constant
+const WM_RBUTTONUP: u32 = windows::Win32::UI::WindowsAndMessaging::WM_RBUTTONUP;
 
 // ============================================================================
 // Global volume controller — accessible from any function in the app
@@ -223,26 +230,21 @@ fn create_window() -> Result<()> {
             return Err(windows::core::Error::from_win32());
         }
 
-        // Create the actual window.
-        //   - Default::default(): no extended styles
+        // Create the hidden message-only window.
+        //   - Default::default(): no visible style
         //   - class_name: the class we just registered
-        //   - title: "Mute/Unmute Microphone" in the title bar
-        //   - WS_OVERLAPPEDWINDOW: standard window with title bar + borders + min/max/close
-        //   - CW_USEDEFAULT: let Windows choose position
-        //   - 300x150: window size in pixels
+        //   - title: "MuteMicHidden"
+        //   - Default::default(): no styles like WS_OVERLAPPEDWINDOW
+        //   - 0, 0, 0, 0: position and size don't matter
         //   - None: no parent window, no menu
         //   - instance: our executable handle
         //   - None: no extra creation data
-        // Note: The window is NOT shown yet — that happens in WM_CREATE via ShowWindow.
         CreateWindowExW(
             Default::default(),
             class_name,
-            w!("Mute/Unmute Microphone"),
-            WS_OVERLAPPEDWINDOW,
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
-            300, // width
-            150, // height
+            w!("MuteMicHidden"),
+            Default::default(), // No visible style
+            0, 0, 0, 0,         // Size/pos don't matter
             None,
             None,
             instance,
@@ -250,6 +252,26 @@ fn create_window() -> Result<()> {
         );
 
         Ok(())
+    }
+}
+
+// ============================================================================
+// show_tray_menu() — Displays the right-click context menu for the tray icon
+// ============================================================================
+fn show_tray_menu(hwnd: HWND) {
+    unsafe {
+        let menu = CreatePopupMenu().unwrap();
+        AppendMenuW(menu, MF_STRING, ID_MUTE as usize, w!("Mute")).unwrap();
+        AppendMenuW(menu, MF_STRING, ID_UNMUTE as usize, w!("Unmute")).unwrap();
+        AppendMenuW(menu, MF_STRING, ID_EXIT as usize, w!("Exit")).unwrap();
+
+        let mut pt = POINT::default();
+        let _ = windows::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut pt);
+
+        // Required: Makes the menu close when clicking outside
+        SetForegroundWindow(hwnd);
+        TrackPopupMenu(menu, TPM_BOTTOMALIGN | TPM_LEFTALIGN,
+                       pt.x, pt.y, 0, hwnd, None);
     }
 }
 
@@ -267,93 +289,109 @@ unsafe extern "system" fn wndproc(
 ) -> LRESULT {
     match msg {
         // ----------------------------------------------------------------
-        // WM_CREATE — Window is being created. Set up the UI controls.
+        // WM_CREATE — Window is being created. Set up the tray icon.
         // ----------------------------------------------------------------
         WM_CREATE => {
-            let instance = GetModuleHandleW(None).unwrap();
-
-            // Create child controls inside our window:
-            //   - "BUTTON" class: a clickable button
-            //   - "STATIC" class: a text label (non-interactive)
-            //   - WS_VISIBLE | WS_CHILD: visible and inside the parent window
-            //   - x, y, width, height: position and size relative to parent
-            //   - HMENU(ID): the control ID (used to identify it in WM_COMMAND)
-            let mute_button = CreateWindowExW(Default::default(), w!("BUTTON"), w!("Mute"), WS_VISIBLE | WS_CHILD, 20, 20, 100, 30, hwnd, HMENU(MUTE_BUTTON_ID), instance, None);
-            let unmute_button = CreateWindowExW(Default::default(), w!("BUTTON"), w!("Unmute"), WS_VISIBLE | WS_CHILD, 140, 20, 100, 30, hwnd, HMENU(UNMUTE_BUTTON_ID), instance, None);
-            let status_label = CreateWindowExW(Default::default(), w!("STATIC"), w!("Status: Unknown"), WS_VISIBLE | WS_CHILD, 20, 70, 220, 20, hwnd, HMENU(-1isize), instance, None);
-
             // Retrieve the volume controller from the global static variable.
-            // .resolve() creates a thread-local COM proxy from the AgileReference.
             let agile_ref = VOLUME_CONTROL.get().expect("Volume control not initialized");
             let volume_control = agile_ref.resolve().expect("Failed to resolve agile reference");
 
-            // Check the current mute state of the mic and display it in the status label.
-            if let Ok(is_muted) = volume_control.GetMute() {
-                let status_text = if is_muted.as_bool() { "Status: Muted" } else { "Status: Unmuted" };
-                let _ = SetWindowTextW(status_label, &HSTRING::from(status_text));
+            // Check initial mute state
+            let is_muted = volume_control.GetMute().unwrap_or(BOOL(0)).as_bool();
+            let tip_text = if is_muted { "MuteMic - Muted" } else { "MuteMic - Unmuted" };
+
+            // Setup tray icon
+            let mut nid: NOTIFYICONDATAW = std::mem::zeroed();
+            nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
+            nid.hWnd = hwnd;
+            nid.uID = 1;
+            nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+            nid.uCallbackMessage = WM_TRAYICON;
+            
+            // We need an instance handle for LoadIconW if we use a custom icon, 
+            // but for IDI_APPLICATION, None is used.
+            nid.hIcon = windows::Win32::UI::WindowsAndMessaging::LoadIconW(None, IDI_APPLICATION).unwrap();
+
+            for (i, c) in tip_text.encode_utf16().enumerate() {
+                if i >= nid.szTip.len() - 1 { break; }
+                nid.szTip[i] = c;
             }
 
-            // Bundle all our state into a heap-allocated struct.
-            // Box::into_raw converts it to a raw pointer so we can store it with the window.
-            // We'll retrieve this pointer in WM_COMMAND and WM_DESTROY.
+            Shell_NotifyIconW(NIM_ADD, &nid);
+
             let app_state = Box::new(AppState {
                 volume_control,
-                _mute_button: mute_button,
-                _unmute_button: unmute_button,
-                status_label,
+                nid,
             });
-            // Store the raw pointer in the window's GWLP_USERDATA slot.
-            // This is the standard Win32 pattern for associating custom data with a window.
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(app_state) as _);
 
-            // Now show the window on screen.
-            ShowWindow(hwnd, SW_SHOW);
-            LRESULT(0) // Return 0 = success for WM_CREATE
+            LRESULT(0)
         }
 
         // ----------------------------------------------------------------
-        // WM_COMMAND — A button was clicked. Mute or unmute accordingly.
+        // WM_COMMAND — A menu item was clicked. Mute/Unmute/Exit.
         // ----------------------------------------------------------------
         WM_COMMAND => {
-            // Retrieve our AppState from the window's GWLP_USERDATA slot.
-            // We stored a raw pointer there in WM_CREATE.
-            let app_state = &*(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const AppState);
+            let app_state_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut AppState;
+            if !app_state_ptr.is_null() {
+                let app_state = &mut *app_state_ptr;
+                let command = wparam.0 as u16;
 
-            // The low word of wparam contains the control ID of the button that was clicked.
-            let command = wparam.0 as u16;
-            if command == MUTE_BUTTON_ID as u16 {
-                // Mute button clicked: set mic to muted.
-                // null() is passed as the event context GUID (not needed for our use case).
-                let _ = app_state.volume_control.SetMute(true, null());
-                let _ = SetWindowTextW(app_state.status_label, &HSTRING::from("Status: Muted"));
-            } else if command == UNMUTE_BUTTON_ID as u16 {
-                // Unmute button clicked: set mic to unmuted.
-                let _ = app_state.volume_control.SetMute(false, null());
-                let _ = SetWindowTextW(app_state.status_label, &HSTRING::from("Status: Unmuted"));
+                let mut update_tip = false;
+                let mut tip_text = "";
+
+                if command == ID_MUTE {
+                    let _ = app_state.volume_control.SetMute(true, null());
+                    tip_text = "MuteMic - Muted";
+                    update_tip = true;
+                } else if command == ID_UNMUTE {
+                    let _ = app_state.volume_control.SetMute(false, null());
+                    tip_text = "MuteMic - Unmuted";
+                    update_tip = true;
+                } else if command == ID_EXIT {
+                    // Handled in WM_DESTROY, but we trigger it by destroying the window
+                    let _ = windows::Win32::UI::WindowsAndMessaging::DestroyWindow(hwnd);
+                }
+
+                if update_tip {
+                    app_state.nid.szTip.fill(0);
+                    for (i, c) in tip_text.encode_utf16().enumerate() {
+                        if i >= app_state.nid.szTip.len() - 1 { break; }
+                        app_state.nid.szTip[i] = c;
+                    }
+                    app_state.nid.uFlags = NIF_TIP;
+                    Shell_NotifyIconW(NIM_MODIFY, &app_state.nid);
+                }
             }
-            LRESULT(0) // Return 0 = we handled the message
+            LRESULT(0)
         }
 
         // ----------------------------------------------------------------
-        // WM_DESTROY — Window is being closed. Clean up and unmute.
+        // WM_TRAYICON — Custom message from the system tray icon
+        // ----------------------------------------------------------------
+        WM_TRAYICON => {
+            let event = (lparam.0 & 0xFFFF) as u32;
+            if event == WM_RBUTTONUP {
+                show_tray_menu(hwnd);
+            }
+            LRESULT(0)
+        }
+
+        // ----------------------------------------------------------------
+        // WM_DESTROY — Window is being closed. Clean up tray icon and unmute.
         // ----------------------------------------------------------------
         WM_DESTROY => {
-            // Retrieve the AppState pointer we stored in WM_CREATE.
             let app_state_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut AppState;
             if !app_state_ptr.is_null() {
-                // Unmute the mic before we exit — so the user isn't left muted.
                 let app_state = &*app_state_ptr;
                 let _ = app_state.volume_control.SetMute(false, null());
-
-                // Convert the raw pointer back into a Box so Rust properly drops/frees it.
-                // This prevents a memory leak of the AppState struct.
+                Shell_NotifyIconW(NIM_DELETE, &app_state.nid);
+                
                 drop(Box::from_raw(app_state_ptr));
             }
 
-            // Post WM_QUIT to the message queue, which causes GetMessageW to return false
-            // and exit the message loop in main().
             PostQuitMessage(0);
-            LRESULT(0) // Return 0 = we handled the message
+            LRESULT(0)
         }
 
         // ----------------------------------------------------------------
