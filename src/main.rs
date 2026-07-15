@@ -1,118 +1,214 @@
-use std::ptr;
-// Use `_getch` from the MSVCRT to read single key presses on Windows.
-unsafe extern "C" {
-    fn _getch() -> i32;
-}
+use std::ptr::null;
+use std::sync::OnceLock;
 
-use windows::core::Result;
-use windows::Win32::Foundation::BOOL;
-use windows::Win32::System::Com::{
-    CoCreateInstance, CoInitialize, CLSCTX_ALL, CLSCTX_INPROC_SERVER,
-};
-use windows::Win32::System::Console::{
-    SetConsoleCtrlHandler, CTRL_C_EVENT, CTRL_CLOSE_EVENT,
-};
-use windows::Win32::Media::Audio::{
-    eCapture, eConsole, IMMDeviceEnumerator, MMDeviceEnumerator,
-};
+use windows::core::{w, HSTRING};
+use windows::core::{AgileReference, Result};
+use windows::Win32::Foundation::{BOOL, HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::UI::WindowsAndMessaging::HMENU;
 use windows::Win32::Media::Audio::Endpoints::IAudioEndpointVolume;
+use windows::Win32::System::Com::{
+    CoCreateInstance, CoInitialize, CLSCTX_INPROC_SERVER, CoUninitialize,
+};
+use windows::Win32::System::Console::{SetConsoleCtrlHandler, CTRL_C_EVENT, CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT};
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::Media::Audio::{eCapture, eConsole, IMMDeviceEnumerator, MMDeviceEnumerator};
 
-// This callback function is triggered by Windows when the console is closing
-// This callback function is triggered by Windows when the console is closing
-unsafe extern "system" fn console_handler(ctrl_type: u32) -> BOOL {
-    // Check if the event is the 'X' button or Ctrl+C
-    if ctrl_type == CTRL_CLOSE_EVENT || ctrl_type == CTRL_C_EVENT {
-        
-        // Explicitly open an unsafe block for the Windows API calls
-        unsafe {
-            // Because Windows runs this handler on a new thread, we must initialize COM here too
-            CoInitialize(None).ok();
+use windows::Win32::UI::WindowsAndMessaging::{
+    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, GetWindowLongPtrW,
+    LoadCursorW, PostQuitMessage, RegisterClassW, SetWindowLongPtrW, SetWindowTextW, ShowWindow,
+    TranslateMessage, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA, IDC_ARROW, MSG,
+    SW_SHOW, WM_COMMAND, WM_CREATE, WM_DESTROY, WNDCLASSW, WS_CHILD, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+};
 
-            // Quickly re-fetch the microphone and force it to unmute
-            if let Ok(enumerator) = CoCreateInstance::<_, IMMDeviceEnumerator>(
-                &MMDeviceEnumerator,
-                None,
-                CLSCTX_INPROC_SERVER,
-            ) {
-                if let Ok(device) = enumerator.GetDefaultAudioEndpoint(eCapture, eConsole) {
-                    if let Ok(volume) = device.Activate::<IAudioEndpointVolume>(CLSCTX_ALL, None as Option<*const _>) {
-                        
-                        // Unmute the mic!
-                        let _ = volume.SetMute(false, ptr::null());
-                    }
-                }
-            }
-        }
-        
-        // Returning false tells Windows we are done and it can proceed to close the app
-        return false.into();
-    }
-    
-    // Ignore other console events
-    false.into()
+struct AppState {
+    volume_control: IAudioEndpointVolume,
+    _mute_button: HWND,
+    _unmute_button: HWND,
+    status_label: HWND,
 }
 
 fn main() -> Result<()> {
     unsafe {
-        // 0. Register our custom handler to catch the console closing
-        SetConsoleCtrlHandler(Some(console_handler), true)?;
-
-        // 1. Initialize the COM library on the main thread
+        // Initialize COM
         CoInitialize(None).ok();
 
-        // 2. Create the COM instance for the Device Enumerator
+        // Get the audio endpoint volume controller
         let enumerator: IMMDeviceEnumerator = CoCreateInstance(
             &MMDeviceEnumerator,
             None,
             CLSCTX_INPROC_SERVER,
         )?;
-
-        // 3. Get the default audio capture device (microphone)
         let device = enumerator.GetDefaultAudioEndpoint(eCapture, eConsole)?;
+        let volume_control: IAudioEndpointVolume = device.Activate(CLSCTX_INPROC_SERVER, None)?;
 
-        // 4. Activate the volume control interface for the device
-        let volume: IAudioEndpointVolume = device.Activate(CLSCTX_ALL, None as Option<*const _>)?;
+        // Store the volume controller in a static variable to access it in the window procedure
+        // and when the application closes.
+        let _ = VOLUME_CONTROL.set(AgileReference::new(&volume_control)?);
 
-        println!("Controls: press keys - m:mute, u:unmute, t:toggle, q:quit");
+        // Register a console control handler to unmute on Ctrl+C, console close, etc.
+        let _ = SetConsoleCtrlHandler(Some(console_ctrl_handler), true);
 
-        loop {
-            // Safe wrapper around C `_getch` which returns an int representing the key.
-            println!("Press a key: ");
-            let ch = _getch();
-            if ch <= 0 {
-                continue;
+        // Create and run the GUI
+        create_window()?;
+
+        // Message loop
+        let mut message = MSG::default();
+        while GetMessageW(&mut message, HWND(0), 0, 0).into() {
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+
+        // Safety net: unmute when the message loop exits
+        unmute_mic();
+    }
+
+    // Uninitialize COM
+    unsafe { CoUninitialize() };
+
+    Ok(())
+}
+
+const MUTE_BUTTON_ID: isize = 1;
+const UNMUTE_BUTTON_ID: isize = 2;
+
+// Use a static OnceLock to safely store the volume controller COM interface.
+// AgileReference allows the COM interface to be used across different threads.
+static VOLUME_CONTROL: OnceLock<AgileReference<IAudioEndpointVolume>> = OnceLock::new();
+
+fn create_window() -> Result<()> {
+    unsafe {
+        let instance = GetModuleHandleW(None)?;
+        let class_name = w!("MuteMicWindowClass");
+
+        let wc = WNDCLASSW {
+            style: CS_HREDRAW | CS_VREDRAW,
+            lpfnWndProc: Some(wndproc),
+            hInstance: instance.into(),
+            lpszClassName: class_name,
+            hCursor: LoadCursorW(None, IDC_ARROW)?,
+            ..Default::default()
+        };
+
+        let atom = RegisterClassW(&wc);
+        if atom == 0 {
+            return Err(windows::core::Error::from_win32());
+        }
+
+        CreateWindowExW(
+            Default::default(),
+            class_name,
+            w!("Mute/Unmute Microphone"),
+            WS_OVERLAPPEDWINDOW,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            300, // width
+            150, // height
+            None,
+            None,
+            instance,
+            None,
+        );
+
+        Ok(())
+    }
+}
+
+unsafe extern "system" fn wndproc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    match msg {
+        WM_CREATE => {
+            let instance = GetModuleHandleW(None).unwrap();
+
+            // Create buttons and static text label
+            let mute_button = CreateWindowExW(Default::default(), w!("BUTTON"), w!("Mute"), WS_VISIBLE | WS_CHILD, 20, 20, 100, 30, hwnd, HMENU(MUTE_BUTTON_ID), instance, None);
+            let unmute_button = CreateWindowExW(Default::default(), w!("BUTTON"), w!("Unmute"), WS_VISIBLE | WS_CHILD, 140, 20, 100, 30, hwnd, HMENU(UNMUTE_BUTTON_ID), instance, None);
+            let status_label = CreateWindowExW(Default::default(), w!("STATIC"), w!("Status: Unknown"), WS_VISIBLE | WS_CHILD, 20, 70, 220, 20, hwnd, HMENU(-1isize), instance, None);
+
+            // Get the volume controller from the static variable
+            let agile_ref = VOLUME_CONTROL.get().expect("Volume control not initialized");
+            let volume_control = agile_ref.resolve().expect("Failed to resolve agile reference");
+
+            // Get initial mute state and update the label
+            if let Ok(is_muted) = volume_control.GetMute() {
+                let status_text = if is_muted.as_bool() { "Status: Muted" } else { "Status: Unmuted" };
+                // We can ignore the result of SetWindowTextW in this context.
+                let _ = SetWindowTextW(status_label, &HSTRING::from(status_text));
             }
-            
-            // map ASCII letters (support upper and lower)
-            let c = (ch as u8) as char;
-            println!("Input: {}", c);
-            
-            match c {
-                'm' | 'M' => {
-                    volume.SetMute(true, ptr::null())?;
-                    println!("Microphone muted");
-                }
-                'u' | 'U' => {
-                    volume.SetMute(false, ptr::null())?;
-                    println!("Microphone unmuted");
-                }
-                't' | 'T' => {
-                    let current = volume.GetMute()?;
-                    let new = !current;
-                    volume.SetMute(new, ptr::null())?;
-                    let status = if new.into() { "Muted" } else { "Unmuted" };
-                    println!("Microphone {}", status);
-                }
-                'q' | 'Q' => {
-                    // Gracefully unmute before quitting via 'q'
-                    volume.SetMute(false, ptr::null())?;
-                    println!("Unmuting and Exiting");
-                    break;
-                }
-                _ => {}
+
+            // Create a state struct and store it with the window for later use
+            let app_state = Box::new(AppState {
+                volume_control,
+                _mute_button: mute_button,
+                _unmute_button: unmute_button,
+                status_label,
+            });
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(app_state) as _);
+
+            ShowWindow(hwnd, SW_SHOW);
+            LRESULT(0)
+        }
+        WM_COMMAND => {
+            let app_state = &*(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const AppState);
+
+            let command = wparam.0 as u16;
+            if command == MUTE_BUTTON_ID as u16 {
+                let _ = app_state.volume_control.SetMute(true, null());
+                let _ = SetWindowTextW(app_state.status_label, &HSTRING::from("Status: Muted"));
+            } else if command == UNMUTE_BUTTON_ID as u16 {
+                let _ = app_state.volume_control.SetMute(false, null());
+                let _ = SetWindowTextW(app_state.status_label, &HSTRING::from("Status: Unmuted"));
+            }
+            LRESULT(0)
+        }
+        WM_DESTROY => {
+            // Unmute on exit
+            // We retrieve the AppState here to ensure we are using the resolved COM pointer
+            // for the current thread before we clean it up.
+            let app_state_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut AppState;
+            if !app_state_ptr.is_null() {
+                // First, get a reference to the state to use it.
+                let app_state = &*app_state_ptr;
+                let _ = app_state.volume_control.SetMute(false, null());
+                // Now, we can safely drop it.
+                drop(Box::from_raw(app_state_ptr));
+            }
+
+            // Clean up state
+
+            PostQuitMessage(0);
+            LRESULT(0)
+        }
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+/// Unmute the microphone using the global VOLUME_CONTROL.
+/// Called from WM_DESTROY, the console control handler, and as a safety net on exit.
+fn unmute_mic() {
+    if let Some(agile_ref) = VOLUME_CONTROL.get() {
+        if let Ok(volume_control) = agile_ref.resolve() {
+            unsafe {
+                let _ = volume_control.SetMute(false, null());
             }
         }
     }
-    
-    Ok(())
+}
+
+/// Console control handler — unmutes the mic on Ctrl+C, console close, logoff, shutdown.
+unsafe extern "system" fn console_ctrl_handler(ctrl_type: u32) -> BOOL {
+    match ctrl_type {
+        x if x == CTRL_C_EVENT
+            || x == CTRL_CLOSE_EVENT
+            || x == CTRL_LOGOFF_EVENT
+            || x == CTRL_SHUTDOWN_EVENT =>
+        {
+            unmute_mic();
+            BOOL(1) // handled
+        }
+        _ => BOOL(0), // not handled
+    }
 }
